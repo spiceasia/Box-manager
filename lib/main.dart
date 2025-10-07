@@ -1,9 +1,10 @@
 import 'dart:convert';
-import 'dart:html' as html; // web-only helpers
+import 'dart:html' as html; // Web-only helpers (download/upload/print)
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:hive_flutter/hive_flutter.dart' as hive;
+import 'package:csv/csv.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -21,10 +22,10 @@ class Box {
 
   Map<String, dynamic> toMap() => {'barcode': barcode, 'name': name, 'van': van};
   static Box fromMap(Map m) => Box(
-    barcode: m['barcode'] as String,
-    name: m['name'] as String,
-    van: m['van'] as String,
-  );
+        barcode: m['barcode'] as String,
+        name: m['name'] as String,
+        van: m['van'] as String,
+      );
 }
 
 class Item {
@@ -41,19 +42,21 @@ class Item {
     this.expiryWarningDays,
   });
   Map<String, dynamic> toMap() => {
-    'barcode': barcode,
-    'name': name,
-    'unitPriceCents': unitPriceCents,
-    'expiresOn': expiresOn?.toIso8601String(),
-    'expiryWarningDays': expiryWarningDays,
-  };
+        'barcode': barcode,
+        'name': name,
+        'unitPriceCents': unitPriceCents,
+        'expiresOn': expiresOn?.toIso8601String(),
+        'expiryWarningDays': expiryWarningDays,
+      };
   static Item fromMap(Map m) => Item(
-    barcode: m['barcode'] as String,
-    name: m['name'] as String,
-    unitPriceCents: (m['unitPriceCents'] as num).toInt(),
-    expiresOn: (m['expiresOn'] as String?) == null ? null : DateTime.tryParse(m['expiresOn'] as String),
-    expiryWarningDays: (m['expiryWarningDays'] as num?)?.toInt(),
-  );
+        barcode: m['barcode'] as String,
+        name: m['name'] as String,
+        unitPriceCents: (m['unitPriceCents'] as num).toInt(),
+        expiresOn: (m['expiresOn'] as String?) == null
+            ? null
+            : DateTime.tryParse(m['expiresOn'] as String),
+        expiryWarningDays: (m['expiryWarningDays'] as num?)?.toInt(),
+      );
 }
 
 class BoxLine {
@@ -64,9 +67,13 @@ class BoxLine {
 
 /// ===== REPO (in-memory + JSON-in-Hive persistence) =====
 class BoxRepo extends ChangeNotifier {
-  final Map<String, Box> _boxes = {};                // box barcode -> Box
-  final Map<String, Item> _items = {};               // item barcode -> Item
-  final Map<String, Map<String, int>> _boxInv = {};  // box -> (item -> qty)
+  final Map<String, Box> _boxes = {}; // box barcode -> Box
+  final Map<String, Item> _items = {}; // item barcode -> Item
+  final Map<String, Map<String, int>> _boxInv = {}; // box -> (item -> qty)
+
+  // persisted list of vans (editable)
+  List<String> _vans = ['Van 1', 'Van 2', 'Van 3'];
+  List<String> get vans => List.unmodifiable(_vans);
 
   late hive.Box _store; // Hive storage
   DateTime? lastLoadedAt;
@@ -77,84 +84,76 @@ class BoxRepo extends ChangeNotifier {
     await _loadFromDisk();
   }
 
-  // Build a pure-JSON snapshot of state
   Map<String, dynamic> _snapshotMap() => {
-    'boxes': _boxes.values.map((b) => b.toMap()).toList(),
-    'items': _items.values.map((i) => i.toMap()).toList(),
-    'inv': _boxInv, // Map<String, Map<String,int>>
-  };
+        'boxes': _boxes.values.map((b) => b.toMap()).toList(),
+        'items': _items.values.map((i) => i.toMap()).toList(),
+        'inv': _boxInv, // Map<String, Map<String,int>>
+        'vans': _vans,
+      };
   String snapshotJson() => jsonEncode(_snapshotMap());
 
   Future<void> _loadFromDisk() async {
     try {
-      // Prefer JSON string key
       final s = _store.get('state_json');
       if (s is String && s.isNotEmpty) {
         final data = jsonDecode(s) as Map<String, dynamic>;
         _applyLoadedMap(data);
         lastLoadedAt = DateTime.now();
-        debugPrint('Loaded JSON from Hive: boxes=${_boxes.length}');
         notifyListeners();
         return;
       }
-
-      // Fallback: legacy Map key (if any)
       final legacy = _store.get('state');
       if (legacy is Map) {
         _applyLoadedMap(Map<String, dynamic>.from(legacy));
         lastLoadedAt = DateTime.now();
-        debugPrint('Loaded legacy Map from Hive: boxes=${_boxes.length}');
-        notifyListeners();
-        // Also convert to JSON storage
         await _store.put('state_json', snapshotJson());
         await _store.flush();
+        notifyListeners();
         return;
       }
-
-      debugPrint('No saved state found.');
       lastLoadedAt = DateTime.now();
       notifyListeners();
-    } catch (e) {
-      debugPrint('Load error: $e');
+    } catch (_) {
       lastLoadedAt = DateTime.now();
       notifyListeners();
     }
   }
 
   void _applyLoadedMap(Map<String, dynamic> data) {
-    // boxes
     _boxes.clear();
     for (final b in (data['boxes'] as List? ?? [])) {
       final bx = Box.fromMap(Map<String, dynamic>.from(b as Map));
       _boxes[bx.barcode] = bx;
     }
-    // items
     _items.clear();
     for (final it in (data['items'] as List? ?? [])) {
       final item = Item.fromMap(Map<String, dynamic>.from(it as Map));
       _items[item.barcode] = item;
     }
-    // inventory
     _boxInv.clear();
     final invMap = Map<String, dynamic>.from((data['inv'] as Map?) ?? {});
     invMap.forEach((boxBarcode, itemMap) {
       _boxInv[boxBarcode] = Map<String, int>.from(
-        (itemMap as Map).map((k, v) => MapEntry(k as String, (v as num).toInt())),
+        (itemMap as Map).map(
+          (k, v) => MapEntry(k as String, (v as num).toInt()),
+        ),
       );
     });
+
+    final vansList = (data['vans'] as List?)?.map((e) => e.toString()).toList();
+    _vans = (vansList == null || vansList.isEmpty)
+        ? ['Van 1', 'Van 2', 'Van 3']
+        : vansList;
   }
 
   Future<void> _saveToDisk() async {
     try {
       final jsonStr = snapshotJson();
       await _store.put('state_json', jsonStr);
-      await _store.flush(); // ensure write completes
+      await _store.flush();
       lastSavedAt = DateTime.now();
-      debugPrint('Saved JSON to Hive: boxes=${_boxes.length}');
       notifyListeners();
-    } catch (e) {
-      debugPrint('Save error: $e');
-    }
+    } catch (_) {}
   }
 
   // Public controls
@@ -164,6 +163,7 @@ class BoxRepo extends ChangeNotifier {
     _boxes.clear();
     _items.clear();
     _boxInv.clear();
+    _vans = ['Van 1', 'Van 2', 'Van 3']; // reset vans to defaults
     await _store.delete('state_json');
     await _store.delete('state'); // legacy
     await _store.flush();
@@ -179,8 +179,17 @@ class BoxRepo extends ChangeNotifier {
       await _store.put('state_json', jsonStr);
       await _store.flush();
       lastSavedAt = DateTime.now();
-    } catch (e) {
-      debugPrint('Import error: $e');
+    } catch (_) {}
+  }
+
+  Future<void> addVan(String name) async {
+    final nm = name.trim();
+    if (nm.isEmpty) return;
+    if (!_vans.contains(nm)) {
+      _vans.add(nm);
+      _vans.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      notifyListeners();
+      await _saveToDisk();
     }
   }
 
@@ -188,6 +197,7 @@ class BoxRepo extends ChangeNotifier {
   List<Box> get allBoxes => _boxes.values.toList();
   Box? findBox(String barcode) => _boxes[barcode];
   Item? findItem(String barcode) => _items[barcode];
+
   List<BoxLine> contents(String boxBarcode) {
     final inv = _boxInv[boxBarcode];
     if (inv == null || inv.isEmpty) return [];
@@ -196,30 +206,40 @@ class BoxRepo extends ChangeNotifier {
       final item = _items[itemBarcode];
       if (item != null && qty > 0) lines.add(BoxLine(item, qty));
     });
-    lines.sort((a, b) => a.item.name.toLowerCase().compareTo(b.item.name.toLowerCase()));
+    lines.sort((a, b) =>
+        a.item.name.toLowerCase().compareTo(b.item.name.toLowerCase()));
     return lines;
   }
-  int getQuantity(String boxBarcode, String itemBarcode) => _boxInv[boxBarcode]?[itemBarcode] ?? 0;
+
+  int getQuantity(String boxBarcode, String itemBarcode) =>
+      _boxInv[boxBarcode]?[itemBarcode] ?? 0;
 
   // mutations (await saves)
-  Future<void> createBox({required String barcode, required String name, required String van}) async {
+  Future<void> createBox(
+      {required String barcode,
+      required String name,
+      required String van}) async {
     if (_boxes.containsKey(barcode)) return;
     _boxes[barcode] = Box(barcode: barcode, name: name, van: van);
     _boxInv.putIfAbsent(barcode, () => {});
+    await addVan(van);
     notifyListeners();
     await _saveToDisk();
   }
 
   Future<void> renameBox(String barcode, String newName) async {
-    final b = _boxes[barcode]; if (b == null) return;
+    final b = _boxes[barcode];
+    if (b == null) return;
     b.name = newName;
     notifyListeners();
     await _saveToDisk();
   }
 
   Future<void> moveBoxToVan(String barcode, String newVan) async {
-    final b = _boxes[barcode]; if (b == null) return;
+    final b = _boxes[barcode];
+    if (b == null) return;
     b.van = newVan;
+    await addVan(newVan);
     notifyListeners();
     await _saveToDisk();
   }
@@ -233,10 +253,11 @@ class BoxRepo extends ChangeNotifier {
   }) async {
     final ex = _items[barcode];
     if (ex != null) {
-      ex.name = name;
-      ex.unitPriceCents = unitPriceCents;
-      ex.expiresOn = expiresOn;
-      ex.expiryWarningDays = expiryWarningDays;
+      ex
+        ..name = name
+        ..unitPriceCents = unitPriceCents
+        ..expiresOn = expiresOn
+        ..expiryWarningDays = expiryWarningDays;
       notifyListeners();
       await _saveToDisk();
       return ex;
@@ -255,7 +276,10 @@ class BoxRepo extends ChangeNotifier {
     }
   }
 
-  Future<void> addToBox({required String boxBarcode, required String itemBarcode, required int quantity}) async {
+  Future<void> addToBox(
+      {required String boxBarcode,
+      required String itemBarcode,
+      required int quantity}) async {
     if (quantity <= 0) return;
     final inv = _boxInv.putIfAbsent(boxBarcode, () => {});
     inv.update(itemBarcode, (q) => q + quantity, ifAbsent: () => quantity);
@@ -263,13 +287,20 @@ class BoxRepo extends ChangeNotifier {
     await _saveToDisk();
   }
 
-  Future<void> removeFromBox({required String boxBarcode, required String itemBarcode, required int quantity}) async {
+  Future<void> removeFromBox(
+      {required String boxBarcode,
+      required String itemBarcode,
+      required int quantity}) async {
     if (quantity <= 0) return;
     final inv = _boxInv[boxBarcode];
     if (inv == null) return;
     final current = inv[itemBarcode] ?? 0;
     final next = current - quantity;
-    if (next <= 0) inv.remove(itemBarcode); else inv[itemBarcode] = next;
+    if (next <= 0) {
+      inv.remove(itemBarcode);
+    } else {
+      inv[itemBarcode] = next;
+    }
     notifyListeners();
     await _saveToDisk();
   }
@@ -284,8 +315,10 @@ class BoxRepo extends ChangeNotifier {
     if (srcBoxBarcode == destBoxBarcode) return false;
     final available = getQuantity(srcBoxBarcode, itemBarcode);
     if (available < quantity) return false;
-    await removeFromBox(boxBarcode: srcBoxBarcode, itemBarcode: itemBarcode, quantity: quantity);
-    await addToBox(boxBarcode: destBoxBarcode, itemBarcode: itemBarcode, quantity: quantity);
+    await removeFromBox(
+        boxBarcode: srcBoxBarcode, itemBarcode: itemBarcode, quantity: quantity);
+    await addToBox(
+        boxBarcode: destBoxBarcode, itemBarcode: itemBarcode, quantity: quantity);
     await _saveToDisk();
     return true;
   }
@@ -299,24 +332,24 @@ class BoxApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Box Manager (Persistent)',
+      title: 'Box Manager',
       theme: ThemeData(useMaterial3: true),
-      home: const ScanHomePage(),
+      home: const HomePage(),
     );
   }
 }
 
-/// ===== HOME (scan / list / save controls) =====
-class ScanHomePage extends StatefulWidget {
-  const ScanHomePage({super.key});
+/// ===== HOME (unified scan/search) =====
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
   @override
-  State<ScanHomePage> createState() => _ScanHomePageState();
+  State<HomePage> createState() => _HomePageState();
 }
 
-class _ScanHomePageState extends State<ScanHomePage> {
+class _HomePageState extends State<HomePage> {
   final FocusNode _focusNode = FocusNode();
   final StringBuffer _buffer = StringBuffer();
-  final TextEditingController _manual = TextEditingController();
+  final TextEditingController _input = TextEditingController();
   static const Duration _timeout = Duration(milliseconds: 500);
   DateTime _lastKeyTime = DateTime.now();
 
@@ -331,7 +364,7 @@ class _ScanHomePageState extends State<ScanHomePage> {
   void dispose() {
     RawKeyboard.instance.removeListener(_onKey);
     _focusNode.dispose();
-    _manual.dispose();
+    _input.dispose();
     super.dispose();
   }
 
@@ -345,7 +378,7 @@ class _ScanHomePageState extends State<ScanHomePage> {
         event.logicalKey == LogicalKeyboardKey.numpadEnter) {
       final code = _buffer.toString().trim();
       _buffer.clear();
-      if (code.isNotEmpty) _handleScan(code);
+      if (code.isNotEmpty) _handleGo(code);
       return;
     }
 
@@ -353,35 +386,42 @@ class _ScanHomePageState extends State<ScanHomePage> {
     if (ch != null && ch.isNotEmpty) _buffer.write(ch);
   }
 
-  Future<void> _handleScan(String code) async {
-    if (code.startsWith('BOX:')) {
-      await _openOrCreateBox(code);
+  Future<void> _handleGo(String code) async {
+    final v = code.trim();
+    if (v.isEmpty) return;
+
+    if (v.startsWith('BOX:')) {
+      // Open or create a box
+      final existing = boxRepo.findBox(v);
+      if (existing != null) {
+        if (!mounted) return;
+        Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => BoxDetailsPage(boxBarcode: v),
+        ));
+      } else {
+        final created = await showDialog<bool>(
+          context: context,
+          builder: (_) => CreateBoxDialog(barcode: v),
+        );
+        if (created == true && mounted) {
+          Navigator.of(context).push(MaterialPageRoute(
+            builder: (_) => BoxDetailsPage(boxBarcode: v),
+          ));
+        }
+      }
     } else {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Item-like scan ($code). Open a box first to add items.')),
-      );
-    }
-  }
-
-  Future<void> _openOrCreateBox(String barcode) async {
-    final existing = boxRepo.findBox(barcode);
-    if (existing != null) {
+      // Treat as ITEM barcode -> show where it is
+      final item = boxRepo.findItem(v);
+      if (item == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Item not found: $v')),
+        );
+        return;
+      }
       if (!mounted) return;
       Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => BoxDetailsPage(boxBarcode: barcode),
-      ));
-      return;
-    }
-
-    final created = await showDialog<bool>(
-      context: context,
-      builder: (_) => CreateBoxDialog(barcode: barcode),
-    );
-
-    if (created == true && mounted) {
-      Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => BoxDetailsPage(boxBarcode: barcode),
+        builder: (_) => ItemWherePage(itemBarcode: v),
       ));
     }
   }
@@ -393,6 +433,7 @@ class _ScanHomePageState extends State<ScanHomePage> {
     return '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')} $hh:$mm';
   }
 
+  // ==== JSON Export/Import (kept in code; UI buttons removed) ====
   void _exportJson() {
     final data = boxRepo.snapshotJson();
     final bytes = utf8.encode(data);
@@ -419,39 +460,204 @@ class _ScanHomePageState extends State<ScanHomePage> {
     input.click();
   }
 
+  // ==== CSV Export/Import ====
+  void _exportCsv() {
+    final rows = <List<dynamic>>[
+      ['BoxBarcode','BoxName','Van','ItemBarcode','ItemName','UnitPriceEUR','Quantity','ExpiryDate','WarnDays'],
+    ];
+
+    final boxes = boxRepo.allBoxes;
+    if (boxes.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No data to export.')));
+      return;
+    }
+
+    for (final b in boxes) {
+      final lines = boxRepo.contents(b.barcode);
+      if (lines.isEmpty) {
+        rows.add([b.barcode, b.name, b.van, '', '', '', 0, '', '']);
+        continue;
+      }
+      for (final line in lines) {
+        final item = line.item;
+        final priceStr = _euroString(item.unitPriceCents);
+        final expStr = item.expiresOn == null ? '' : fmtYmd(item.expiresOn!);
+        final warn = item.expiryWarningDays?.toString() ?? '';
+        rows.add([
+          b.barcode, b.name, b.van,
+          item.barcode, item.name,
+          priceStr,
+          line.qty,
+          expStr,
+          warn,
+        ]);
+      }
+    }
+
+    final csvText = const ListToCsvConverter().convert(rows);
+    final bytes = utf8.encode(csvText);
+    final blob = html.Blob([bytes], 'text/csv');
+    final url = html.Url.createObjectUrlFromBlob(blob);
+    final a = html.AnchorElement(href: url)..download = 'box_manager_inventory.csv';
+    a.click();
+    html.Url.revokeObjectUrl(url);
+
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('CSV exported.')));
+  }
+
+  Future<void> _importCsv() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Import CSV'),
+        content: const Text('This will replace your current data with the CSV contents. Continue?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Import')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    final input = html.FileUploadInputElement()..accept = '.csv,text/csv';
+    input.onChange.listen((_) async {
+      final file = input.files?.first;
+      if (file == null) return;
+      final reader = html.FileReader();
+      reader.readAsText(file);
+      await reader.onLoad.first;
+      final txt = reader.result as String;
+
+      final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(txt);
+      if (rows.isEmpty) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('CSV is empty.')));
+        return;
+      }
+
+      final header = rows.first.map((e) => (e?.toString() ?? '').trim().toLowerCase()).toList();
+      int col(String name) {
+        final i = header.indexOf(name.toLowerCase());
+        if (i < 0) {
+          throw 'Missing column "$name". Expected header: BoxBarcode,BoxName,Van,ItemBarcode,ItemName,UnitPriceEUR,Quantity,ExpiryDate,WarnDays';
+        }
+        return i;
+      }
+
+      try {
+        final iBoxBc  = col('boxbarcode');
+        final iBoxNm  = col('boxname');
+        final iVan    = col('van');
+        final iItBc   = col('itembarcode');
+        final iItNm   = col('itemname');
+        final iPrice  = col('unitpriceeur');
+        final iQty    = col('quantity');
+        final iExp    = col('expirydate');
+        final iWarn   = col('warndays');
+
+        await boxRepo.wipeAll();
+
+        for (var r = 1; r < rows.length; r++) {
+          final row = rows[r].map((e) => (e?.toString() ?? '').trim()).toList();
+          if (row.every((cell) => cell.isEmpty)) continue;
+
+          final boxBc = row[iBoxBc];
+          if (boxBc.isEmpty) continue;
+
+          final boxName = row[iBoxNm].isEmpty ? boxBc : row[iBoxNm];
+          final van     = row[iVan].isEmpty ? 'Van 1' : row[iVan];
+
+          if (boxRepo.findBox(boxBc) == null) {
+            await boxRepo.createBox(barcode: boxBc, name: boxName, van: van);
+          } else {
+            await boxRepo.renameBox(boxBc, boxName);
+            await boxRepo.moveBoxToVan(boxBc, van);
+          }
+
+          final itemBc = row[iItBc];
+          if (itemBc.isEmpty) continue;
+
+          final itemName = row[iItNm].isEmpty ? itemBc : row[iItNm];
+          final priceCents = _parseEuroToCents(row[iPrice]) ?? 0;
+          final qty = int.tryParse(row[iQty]) ?? 0;
+          final exp = row[iExp].isEmpty ? null : _tryParseYMD(row[iExp]);
+          final warnDays = row[iWarn].isEmpty ? null : int.tryParse(row[iWarn]);
+
+          await boxRepo.upsertItem(
+            barcode: itemBc,
+            name: itemName,
+            unitPriceCents: priceCents,
+            expiresOn: exp,
+            expiryWarningDays: warnDays,
+          );
+          if (qty > 0) {
+            await boxRepo.addToBox(boxBarcode: boxBc, itemBarcode: itemBc, quantity: qty);
+          }
+        }
+
+        await boxRepo.saveNow();
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('CSV imported.')));
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Import error: $e')));
+      }
+    });
+    input.click();
+  }
+
+  Future<void> _onAddBox() async {
+    final res = await showDialog<_NewBoxResult>(
+      context: context,
+      builder: (_) => const NewBoxDialog(),
+    );
+    if (res == null) return;
+
+    var bc = res.barcode.trim();
+    if (bc.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Barcode is required')));
+      return;
+    }
+    if (!bc.startsWith('BOX:')) bc = 'BOX:$bc';
+
+    if (boxRepo.findBox(bc) != null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('A box with this barcode already exists')));
+      return;
+    }
+
+    await boxRepo.createBox(barcode: bc, name: res.name.trim(), van: res.van);
+    if (!mounted) return;
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => BoxDetailsPage(boxBarcode: bc),
+    ));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Scan a Box (Persistent)'),
+        title: const Text('Box Manager'),
         actions: [
-          IconButton(
-            tooltip: 'Reload from disk',
-            onPressed: () async {
-              await boxRepo.reloadNow();
-              if (!mounted) return;
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Reloaded from disk')));
-            },
-            icon: const Icon(Icons.refresh),
-          ),
           IconButton(
             tooltip: 'Save Now',
             onPressed: () async {
               await boxRepo.saveNow();
               if (!mounted) return;
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved')));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Saved')),
+              );
             },
             icon: const Icon(Icons.save),
           ),
           IconButton(
-            tooltip: 'Export JSON',
-            onPressed: _exportJson,
-            icon: const Icon(Icons.download),
+            tooltip: 'Export CSV',
+            onPressed: _exportCsv,
+            icon: const Icon(Icons.table_view),
           ),
           IconButton(
-            tooltip: 'Import JSON',
-            onPressed: _importJson,
-            icon: const Icon(Icons.upload),
+            tooltip: 'Import CSV',
+            onPressed: _importCsv,
+            icon: const Icon(Icons.upload_file),
           ),
           IconButton(
             tooltip: 'Wipe All',
@@ -470,7 +676,9 @@ class _ScanHomePageState extends State<ScanHomePage> {
               if (ok == true) {
                 await boxRepo.wipeAll();
                 if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('All data wiped')));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('All data wiped')),
+                );
               }
             },
             icon: const Icon(Icons.delete_forever),
@@ -484,51 +692,48 @@ class _ScanHomePageState extends State<ScanHomePage> {
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                Expanded(
-                  child: Text('Last loaded: ${_fmtTime(boxRepo.lastLoadedAt)}   •   Last saved: ${_fmtTime(boxRepo.lastSavedAt)}'),
-                ),
-              ]),
-              const SizedBox(height: 12),
-              const Text('Scan a box (BOX:...) or type below and press Enter.'),
+              Text('Last loaded: ${_fmtTime(boxRepo.lastLoadedAt)}   •   Last saved: ${_fmtTime(boxRepo.lastSavedAt)}'),
+              const SizedBox(height: 16),
+
+              // Big Add Box button
+              Row(
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: _onAddBox,
+                    icon: const Icon(Icons.add_box),
+                    label: const Text('Add Box'),
+                    style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12)),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 16),
+              const Text('Scan/Type ANY barcode (box or item), then press Enter or Go.'),
               const SizedBox(height: 8),
               Row(children: [
                 Expanded(
                   child: TextField(
-                    controller: _manual,
+                    controller: _input,
                     decoration: const InputDecoration(
-                      labelText: 'Type e.g. BOX:demo-123 then Enter or Add',
+                      labelText: 'Example: BOX:van1-001  or  4006381333931',
                       border: OutlineInputBorder(),
                     ),
                     onSubmitted: (v) async {
-                      await _handleScan(v.trim());
-                      _manual.clear();
+                      await _handleGo(v.trim());
+                      _input.clear();
                     },
                   ),
                 ),
                 const SizedBox(width: 8),
                 ElevatedButton(
                   onPressed: () async {
-                    await _handleScan(_manual.text.trim());
-                    _manual.clear();
+                    await _handleGo(_input.text.trim());
+                    _input.clear();
                   },
-                  child: const Text('Add'),
+                  child: const Text('Go'),
                 ),
               ]),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8, runSpacing: 8,
-                children: [
-                  OutlinedButton(
-                    onPressed: () => _handleScan('BOX:demo-123'),
-                    child: const Text('Test Box (BOX:demo-123)'),
-                  ),
-                  OutlinedButton(
-                    onPressed: () => _handleScan('BOX:van2-001'),
-                    child: const Text('Test Box (BOX:van2-001)'),
-                  ),
-                ],
-              ),
+
               const SizedBox(height: 16),
               const Divider(),
               const Text('Existing boxes:', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -544,10 +749,43 @@ class _ScanHomePageState extends State<ScanHomePage> {
                       separatorBuilder: (_, __) => const Divider(height: 1),
                       itemBuilder: (context, i) {
                         final b = boxes[i];
+
+                        // Inventory lines for this box
+                        final lines = boxRepo.contents(b.barcode);
+
+                        // Total quantity = sum of all item quantities
+                        final totalQty = lines.fold<int>(0, (sum, line) => sum + line.qty);
+
+                        // Expiry by QUANTITY
+                        int expSoonQty = 0, expiredQty = 0;
+                        for (final line in lines) {
+                          final d = daysUntil(line.item.expiresOn);
+                          if (d != null) {
+                            if (d < 0) {
+                              expiredQty += line.qty;
+                            } else if (line.item.expiryWarningDays != null &&
+                                       d <= line.item.expiryWarningDays!) {
+                              expSoonQty += line.qty;
+                            }
+                          }
+                        }
+                        final expTotalQty = expSoonQty + expiredQty;
+
                         return ListTile(
                           leading: const Icon(Icons.inventory_2_outlined),
                           title: Text(b.name),
-                          subtitle: Text('Barcode: ${b.barcode}   •   Van: ${b.van}'),
+                          subtitle: Text('Van: ${b.van} • Box: ${b.barcode}'),
+                          trailing: Wrap(
+                            spacing: 6,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: [
+                              Chip(label: Text('Qty $totalQty')),
+                              if (expTotalQty > 0)
+                                Chip(
+                                  label: Text('Exp $expTotalQty (${expiredQty}✖)'),
+                                ),
+                            ],
+                          ),
                           onTap: () => Navigator.of(context).push(
                             MaterialPageRoute(builder: (_) => BoxDetailsPage(boxBarcode: b.barcode)),
                           ),
@@ -565,7 +803,7 @@ class _ScanHomePageState extends State<ScanHomePage> {
   }
 }
 
-/// ===== CREATE BOX DIALOG =====
+/// ===== CREATE-BOX (for unknown BOX:...) =====
 class CreateBoxDialog extends StatefulWidget {
   final String barcode;
   const CreateBoxDialog({super.key, required this.barcode});
@@ -576,8 +814,13 @@ class CreateBoxDialog extends StatefulWidget {
 class _CreateBoxDialogState extends State<CreateBoxDialog> {
   final _formKey = GlobalKey<FormState>();
   final _nameCtrl = TextEditingController();
-  String _van = 'Van 1';
-  final _vans = const ['Van 1', 'Van 2', 'Van 3'];
+  late String _van;
+
+  @override
+  void initState() {
+    super.initState();
+    _van = (boxRepo.vans.isNotEmpty ? boxRepo.vans.first : 'Van 1');
+  }
 
   @override
   void dispose() {
@@ -585,14 +828,39 @@ class _CreateBoxDialogState extends State<CreateBoxDialog> {
     super.dispose();
   }
 
+  Future<void> _promptAddVan() async {
+    final ctrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Add van'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(
+            labelText: 'Van name (e.g., Van 4)',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, ctrl.text.trim()), child: const Text('Add')),
+        ],
+      ),
+    );
+    if (name == null || name.trim().isEmpty) return;
+    await boxRepo.addVan(name);
+    setState(() => _van = name.trim());
+  }
+
   @override
   Widget build(BuildContext context) {
+    final vans = boxRepo.vans;
     return AlertDialog(
       title: const Text('Create Box'),
       content: Form(
         key: _formKey,
         child: SizedBox(
-          width: 360,
+          width: 380,
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             Text('Barcode: ${widget.barcode}', style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 12),
@@ -602,11 +870,23 @@ class _CreateBoxDialogState extends State<CreateBoxDialog> {
               validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter a name' : null,
             ),
             const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              value: _van,
-              items: _vans.map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(),
-              onChanged: (v) => setState(() => _van = v ?? 'Van 1'),
-              decoration: const InputDecoration(labelText: 'Van', border: OutlineInputBorder()),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    value: vans.contains(_van) ? _van : (vans.isNotEmpty ? vans.first : 'Van 1'),
+                    items: vans.map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(),
+                    onChanged: (v) => setState(() => _van = v ?? _van),
+                    decoration: const InputDecoration(labelText: 'Van', border: OutlineInputBorder()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Add van',
+                  onPressed: _promptAddVan,
+                  icon: const Icon(Icons.add),
+                ),
+              ],
             ),
           ]),
         ),
@@ -619,6 +899,126 @@ class _CreateBoxDialogState extends State<CreateBoxDialog> {
               await boxRepo.createBox(barcode: widget.barcode, name: _nameCtrl.text.trim(), van: _van);
               if (!mounted) return;
               Navigator.pop(context, true);
+            }
+          },
+          child: const Text('Create'),
+        ),
+      ],
+    );
+  }
+}
+
+/// ===== MANUAL “ADD BOX” DIALOG =====
+class _NewBoxResult {
+  final String barcode;
+  final String name;
+  final String van;
+  const _NewBoxResult({required this.barcode, required this.name, required this.van});
+}
+
+class NewBoxDialog extends StatefulWidget {
+  const NewBoxDialog({super.key});
+  @override
+  State<NewBoxDialog> createState() => _NewBoxDialogState();
+}
+
+class _NewBoxDialogState extends State<NewBoxDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _barcodeCtrl = TextEditingController();
+  final _nameCtrl = TextEditingController();
+  late String _van;
+
+  @override
+  void initState() {
+    super.initState();
+    _van = (boxRepo.vans.isNotEmpty ? boxRepo.vans.first : 'Van 1');
+  }
+
+  @override
+  void dispose() {
+    _barcodeCtrl.dispose();
+    _nameCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _promptAddVan() async {
+    final ctrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Add van'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(
+            labelText: 'Van name (e.g., Van 4)',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, ctrl.text.trim()), child: const Text('Add')),
+        ],
+      ),
+    );
+    if (name == null || name.trim().isEmpty) return;
+    await boxRepo.addVan(name);
+    setState(() => _van = name.trim());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final vans = boxRepo.vans;
+    return AlertDialog(
+      title: const Text('Add Box'),
+      content: Form(
+        key: _formKey,
+        child: SizedBox(
+          width: 380,
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextFormField(
+              controller: _barcodeCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Box Barcode (auto-add BOX: if missing)',
+                border: OutlineInputBorder(),
+              ),
+              validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter a barcode' : null,
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _nameCtrl,
+              decoration: const InputDecoration(labelText: 'Box name', border: OutlineInputBorder()),
+              validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter a name' : null,
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    value: vans.contains(_van) ? _van : (vans.isNotEmpty ? vans.first : 'Van 1'),
+                    items: vans.map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(),
+                    onChanged: (v) => setState(() => _van = v ?? _van),
+                    decoration: const InputDecoration(labelText: 'Van', border: OutlineInputBorder()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Add van',
+                  onPressed: _promptAddVan,
+                  icon: const Icon(Icons.add),
+                ),
+              ],
+            ),
+          ]),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        ElevatedButton(
+          onPressed: () {
+            if (_formKey.currentState!.validate()) {
+              final bc = _barcodeCtrl.text.trim();
+              final nm = _nameCtrl.text.trim();
+              Navigator.pop(context, _NewBoxResult(barcode: bc, name: nm, van: _van));
             }
           },
           child: const Text('Create'),
@@ -698,7 +1098,6 @@ class _BoxDetailsPageState extends State<BoxDetailsPage> {
     );
     if (result == null) return;
 
-    // Ensure destination exists (create if needed)
     Box? dest = boxRepo.findBox(result.destBoxBarcode);
     if (dest == null && result.destBoxBarcode.startsWith('BOX:')) {
       final created = await showDialog<bool>(
@@ -737,150 +1136,226 @@ class _BoxDetailsPageState extends State<BoxDetailsPage> {
     ));
   }
 
+  Future<void> _editItem(Item item) async {
+    final res = await showDialog<_EditItemResult>(
+      context: context,
+      builder: (_) => _EditItemDialog(item: item),
+    );
+    if (res == null) return;
+    await boxRepo.upsertItem(
+      barcode: item.barcode,
+      name: res.name,
+      unitPriceCents: res.unitPriceCents,
+      expiresOn: res.expiresOn,
+      expiryWarningDays: res.expiryWarningDays,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final box = boxRepo.findBox(widget.boxBarcode);
-    if (box == null) {
-      return Scaffold(appBar: AppBar(title: const Text('Box not found')), body: const Center(child: Text('Missing box')));
-    }
+    // LISTEN to repo so +/- reflects immediately
+    return AnimatedBuilder(
+      animation: boxRepo,
+      builder: (context, _) {
+        final box = boxRepo.findBox(widget.boxBarcode);
+        if (box == null) {
+          return Scaffold(
+            appBar: AppBar(title: const Text('Box not found')),
+            body: const Center(child: Text('Missing box')),
+          );
+        }
 
-    final lines = boxRepo.contents(box.barcode);
+        final lines = boxRepo.contents(box.barcode);
 
-    return Scaffold(
-      appBar: AppBar(title: Text(box.name)),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Barcode: ${box.barcode}'),
-          Text('Van: ${box.van}'),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              ElevatedButton.icon(
-                onPressed: () => _showEditBoxDialog(context, box),
-                icon: const Icon(Icons.edit),
-                label: const Text('Edit Box'),
-              ),
-              const SizedBox(width: 8),
-              FilledButton.icon(
-                onPressed: () => _openPrintLabel(box),
-                icon: const Icon(Icons.print),
-                label: const Text('Print QR'),
-              ),
-              const SizedBox(width: 8),
-              OutlinedButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('Back'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-
-          // Add item area
-          Row(children: [
-            Expanded(
-              child: TextField(
-                controller: _itemScanCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Scan/Type item barcode, then Enter or Add',
-                  border: OutlineInputBorder(),
-                ),
-                onSubmitted: (v) => _handleItemScan(v),
-              ),
-            ),
-            const SizedBox(width: 8),
-            ElevatedButton(
-              onPressed: () => _handleItemScan(_itemScanCtrl.text),
-              child: const Text('Add'),
-            ),
-          ]),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8, runSpacing: 8,
-            children: [
-              OutlinedButton(
-                onPressed: () => _handleItemScan('4006381333931'),
-                child: const Text('Test Item (EAN-13)'),
-              ),
-              OutlinedButton(
-                onPressed: () => _handleItemScan('CODE128-ABC123'),
-                child: const Text('Test Item (Code128-like)'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          const Divider(),
-          const Text('Items in this box:', style: TextStyle(fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          Expanded(
-            child: lines.isEmpty
-                ? const Center(child: Text('No items yet. Add one above.'))
-                : ListView.separated(
-                    itemCount: lines.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (context, i) {
-                      final line = lines[i];
-
-                      // expiry text + badge
-                      final expText = (line.item.expiresOn != null)
-                          ? ' • Exp: ${fmtYmd(line.item.expiresOn!)}'
-                          : '';
-                      final d = daysUntil(line.item.expiresOn);
-                      Widget? badge;
-                      if (d != null) {
-                        if (d < 0) {
-                          badge = const Chip(label: Text('Expired'));
-                        } else if (line.item.expiryWarningDays != null && d <= line.item.expiryWarningDays!) {
-                          badge = Chip(label: Text('Expiring in ${d}d'));
-                        }
-                      }
-
-                      return ListTile(
-                        leading: const Icon(Icons.qr_code_2),
-                        title: Text(line.item.name),
-                        subtitle: Text('Barcode: ${line.item.barcode} • Unit: ${fmtEuro(line.item.unitPriceCents)}$expText'),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (badge != null) ...[badge, const SizedBox(width: 8)],
-                            IconButton(
-                              tooltip: 'Move',
-                              onPressed: () => _moveItem(line.item),
-                              icon: const Icon(Icons.drive_file_move_outlined),
-                            ),
-                            IconButton(
-                              tooltip: 'Remove 1',
-                              onPressed: () => boxRepo.removeFromBox(
-                                boxBarcode: box.barcode,
-                                itemBarcode: line.item.barcode,
-                                quantity: 1,
-                              ),
-                              icon: const Icon(Icons.remove),
-                            ),
-                            Text('${line.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                            IconButton(
-                              tooltip: 'Add 1',
-                              onPressed: () => boxRepo.addToBox(
-                                boxBarcode: box.barcode,
-                                itemBarcode: line.item.barcode,
-                                quantity: 1,
-                              ),
-                              icon: const Icon(Icons.add),
-                            ),
-                          ],
-                        ),
-                      );
-                    },
+        return Scaffold(
+          appBar: AppBar(title: Text(box.name)),
+          body: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Barcode: ${box.barcode}'),
+              Text('Van: ${box.van}'),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: () => _showEditBoxDialog(context, box),
+                    icon: const Icon(Icons.edit),
+                    label: const Text('Edit Box'),
                   ),
+                  const SizedBox(width: 8),
+                  FilledButton.icon(
+                    onPressed: () => _openPrintLabel(box),
+                    icon: const Icon(Icons.print),
+                    label: const Text('Print QR'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Back'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+
+              // Add item area
+              Row(children: [
+                Expanded(
+                  child: TextField(
+                    controller: _itemScanCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Scan/Type item barcode, then Enter or Add',
+                      border: OutlineInputBorder(),
+                    ),
+                    onSubmitted: (v) => _handleItemScan(v),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  onPressed: () => _handleItemScan(_itemScanCtrl.text),
+                  child: const Text('Add'),
+                ),
+              ]),
+              const SizedBox(height: 16),
+              const Divider(),
+              const Text('Items in this box:', style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Expanded(
+                child: lines.isEmpty
+                    ? const Center(child: Text('No items yet. Add one above.'))
+                    : ListView.separated(
+                        itemCount: lines.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        itemBuilder: (context, i) {
+                          final line = lines[i];
+
+                          final expText = (line.item.expiresOn != null)
+                              ? ' • Exp: ${fmtYmd(line.item.expiresOn!)}'
+                              : '';
+                          final d = daysUntil(line.item.expiresOn);
+                          Widget? badge;
+                          if (d != null) {
+                            if (d < 0) {
+                              badge = const Chip(label: Text('Expired'));
+                            } else if (line.item.expiryWarningDays != null && d <= line.item.expiryWarningDays!) {
+                              badge = Chip(label: Text('Expiring in ${d}d'));
+                            }
+                          }
+
+                          return ListTile(
+                            leading: const Icon(Icons.qr_code_2),
+                            title: Text(line.item.name),
+                            subtitle: Text('Barcode: ${line.item.barcode} • Unit: ${fmtEuro(line.item.unitPriceCents)}$expText'),
+                            onTap: () => _editItem(line.item), // tap to edit
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (badge != null) ...[badge, const SizedBox(width: 8)],
+                                IconButton(
+                                  tooltip: 'Move',
+                                  onPressed: () => _moveItem(line.item),
+                                  icon: const Icon(Icons.drive_file_move_outlined),
+                                ),
+                                IconButton(
+                                  tooltip: 'Remove 1',
+                                  onPressed: () => boxRepo.removeFromBox(
+                                    boxBarcode: box.barcode,
+                                    itemBarcode: line.item.barcode,
+                                    quantity: 1,
+                                  ),
+                                  icon: const Icon(Icons.remove),
+                                ),
+                                Text('${line.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                                IconButton(
+                                  tooltip: 'Add 1',
+                                  onPressed: () => boxRepo.addToBox(
+                                    boxBarcode: box.barcode,
+                                    itemBarcode: line.item.barcode,
+                                    quantity: 1,
+                                  ),
+                                  icon: const Icon(Icons.add),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ]),
           ),
-        ]),
-      ),
+        );
+      },
     );
   }
 
   void _showEditBoxDialog(BuildContext context, Box box) {
     showDialog(context: context, builder: (_) => _EditBoxDialog(box: box));
   }
+}
+
+/// ===== ITEM WHERE PAGE (search results) =====
+class ItemWherePage extends StatelessWidget {
+  final String itemBarcode;
+  const ItemWherePage({super.key, required this.itemBarcode});
+
+  @override
+  Widget build(BuildContext context) {
+    final item = boxRepo.findItem(itemBarcode);
+    final boxes = boxRepo.allBoxes;
+    final results = <_ItemLocation>[];
+    for (final b in boxes) {
+      final q = boxRepo.getQuantity(b.barcode, itemBarcode);
+      if (q > 0) results.add(_ItemLocation(box: b, qty: q));
+    }
+    results.sort((a, b) => a.box.name.toLowerCase().compareTo(b.box.name.toLowerCase()));
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Where is this item?')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: item == null
+            ? const Center(child: Text('Item not found.'))
+            : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Item: ${item.name}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                Text('Barcode: ${item.barcode} • Unit: ${fmtEuro(item.unitPriceCents)}'),
+                if (item.expiresOn != null) Text('Expiry: ${fmtYmd(item.expiresOn!)}'),
+                const SizedBox(height: 16),
+                const Divider(),
+                Text(results.isEmpty
+                    ? 'No boxes currently hold this item.'
+                    : 'Found in ${results.length} box(es):',
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: results.isEmpty
+                      ? const SizedBox.shrink()
+                      : ListView.separated(
+                          itemCount: results.length,
+                          separatorBuilder: (_, __) => const Divider(height: 1),
+                          itemBuilder: (context, i) {
+                            final r = results[i];
+                            return ListTile(
+                              leading: const Icon(Icons.inventory_2_outlined),
+                              title: Text(r.box.name),
+                              subtitle: Text('Van: ${r.box.van} • Box barcode: ${r.box.barcode}'),
+                              trailing: Text('Qty: ${r.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                              onTap: () => Navigator.of(context).push(
+                                MaterialPageRoute(builder: (_) => BoxDetailsPage(boxBarcode: r.box.barcode)),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ]),
+      ),
+    );
+  }
+}
+
+class _ItemLocation {
+  final Box box;
+  final int qty;
+  _ItemLocation({required this.box, required this.qty});
 }
 
 /// ===== PRINT LABEL PAGE =====
@@ -925,11 +1400,12 @@ class _EditBoxDialog extends StatefulWidget {
   @override
   State<_EditBoxDialog> createState() => _EditBoxDialogState();
 }
+
 class _EditBoxDialogState extends State<_EditBoxDialog> {
   final _formKey = GlobalKey<FormState>();
   late final TextEditingController _nameCtrl;
-  String _van = 'Van 1';
-  final _vans = const ['Van 1', 'Van 2', 'Van 3'];
+  late String _van;
+
   @override
   void initState() {
     super.initState();
@@ -938,14 +1414,40 @@ class _EditBoxDialogState extends State<_EditBoxDialog> {
   }
   @override
   void dispose() { _nameCtrl.dispose(); super.dispose(); }
+
+  Future<void> _promptAddVan() async {
+    final ctrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Add van'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(
+            labelText: 'Van name (e.g., Van 4)',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, ctrl.text.trim()), child: const Text('Add')),
+        ],
+      ),
+    );
+    if (name == null || name.trim().isEmpty) return;
+    await boxRepo.addVan(name);
+    setState(() => _van = name.trim());
+  }
+
   @override
   Widget build(BuildContext context) {
+    final vans = boxRepo.vans;
     return AlertDialog(
       title: const Text('Edit Box'),
       content: Form(
         key: _formKey,
         child: SizedBox(
-          width: 360,
+          width: 380,
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             Text('Barcode: ${widget.box.barcode}', style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 12),
@@ -955,11 +1457,23 @@ class _EditBoxDialogState extends State<_EditBoxDialog> {
               validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter a name' : null,
             ),
             const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              value: _van,
-              items: _vans.map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(),
-              onChanged: (v) => setState(() => _van = v ?? 'Van 1'),
-              decoration: const InputDecoration(labelText: 'Van', border: OutlineInputBorder()),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    value: vans.contains(_van) ? _van : (vans.isNotEmpty ? vans.first : 'Van 1'),
+                    items: vans.map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(),
+                    onChanged: (v) => setState(() => _van = v ?? _van),
+                    decoration: const InputDecoration(labelText: 'Van', border: OutlineInputBorder()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Add van',
+                  onPressed: _promptAddVan,
+                  icon: const Icon(Icons.add),
+                ),
+              ],
             ),
           ]),
         ),
@@ -982,7 +1496,7 @@ class _EditBoxDialogState extends State<_EditBoxDialog> {
   }
 }
 
-/// ===== ITEM DIALOGS (with expiry) =====
+/// ===== NEW ITEM DIALOG =====
 class _NewItemResult {
   final String name;
   final int unitPriceCents;
@@ -1102,38 +1616,104 @@ class _NewItemDialogState extends State<_NewItemDialog> {
   }
 }
 
-class _QtyDialog extends StatefulWidget {
-  final String title;
-  final int initial;
-  const _QtyDialog({required this.title, this.initial = 1});
-  @override
-  State<_QtyDialog> createState() => _QtyDialogState();
+/// ===== EDIT ITEM DIALOG =====
+class _EditItemResult {
+  final String name;
+  final int unitPriceCents;
+  final DateTime? expiresOn;
+  final int? expiryWarningDays;
+  _EditItemResult({
+    required this.name,
+    required this.unitPriceCents,
+    this.expiresOn,
+    this.expiryWarningDays,
+  });
 }
-class _QtyDialogState extends State<_QtyDialog> {
+
+class _EditItemDialog extends StatefulWidget {
+  final Item item;
+  const _EditItemDialog({required this.item});
+  @override
+  State<_EditItemDialog> createState() => _EditItemDialogState();
+}
+
+class _EditItemDialogState extends State<_EditItemDialog> {
   final _formKey = GlobalKey<FormState>();
-  late final TextEditingController _qtyCtrl;
+  late final TextEditingController _nameCtrl;
+  late final TextEditingController _priceCtrl;
+  late final TextEditingController _expiryCtrl; // YYYY-MM-DD
+  late final TextEditingController _warnCtrl;   // days (int)
+
   @override
-  void initState() { super.initState(); _qtyCtrl = TextEditingController(text: widget.initial.toString()); }
+  void initState() {
+    super.initState();
+    _nameCtrl = TextEditingController(text: widget.item.name);
+    _priceCtrl = TextEditingController(text: _euroString(widget.item.unitPriceCents));
+    _expiryCtrl = TextEditingController(text: widget.item.expiresOn == null ? '' : fmtYmd(widget.item.expiresOn!));
+    _warnCtrl = TextEditingController(text: widget.item.expiryWarningDays?.toString() ?? '');
+  }
+
   @override
-  void dispose() { _qtyCtrl.dispose(); super.dispose(); }
+  void dispose() {
+    _nameCtrl.dispose();
+    _priceCtrl.dispose();
+    _expiryCtrl.dispose();
+    _warnCtrl.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: Text(widget.title),
+      title: const Text('Edit Item'),
       content: Form(
         key: _formKey,
         child: SizedBox(
-          width: 240,
-          child: TextFormField(
-            controller: _qtyCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Quantity', border: OutlineInputBorder()),
-            validator: (v) {
-              final n = int.tryParse(v ?? '');
-              if (n == null || n <= 0) return 'Enter a positive number';
-              return null;
-            },
-          ),
+          width: 360,
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text('Barcode: ${widget.item.barcode}', style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _nameCtrl,
+              decoration: const InputDecoration(labelText: 'Item name', border: OutlineInputBorder()),
+              validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter a name' : null,
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _priceCtrl,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(labelText: 'Unit price (€)', border: OutlineInputBorder()),
+              validator: (v) {
+                if (v == null || v.trim().isEmpty) return 'Enter price';
+                return _parseEuroToCents(v) == null ? 'Invalid price' : null;
+              },
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _expiryCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Expiry date (YYYY-MM-DD) — optional',
+                border: OutlineInputBorder(),
+                suffixIcon: Icon(Icons.calendar_today),
+              ),
+              validator: (v) {
+                if (v == null || v.trim().isEmpty) return null;
+                return _tryParseYMD(v.trim()) == null ? 'Use format YYYY-MM-DD' : null;
+              },
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _warnCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Warn me N days before (optional)', border: OutlineInputBorder()),
+              validator: (v) {
+                if (v == null || v.trim().isEmpty) return null;
+                final n = int.tryParse(v.trim());
+                if (n == null || n < 0) return 'Enter a non-negative number';
+                return null;
+              },
+            ),
+          ]),
         ),
       ),
       actions: [
@@ -1141,10 +1721,18 @@ class _QtyDialogState extends State<_QtyDialog> {
         ElevatedButton(
           onPressed: () {
             if (_formKey.currentState!.validate()) {
-              Navigator.pop(context, int.parse(_qtyCtrl.text.trim()));
+              final cents = _parseEuroToCents(_priceCtrl.text.trim())!;
+              final expires = _expiryCtrl.text.trim().isEmpty ? null : _tryParseYMD(_expiryCtrl.text.trim());
+              final warnDays = _warnCtrl.text.trim().isEmpty ? null : int.parse(_warnCtrl.text.trim());
+              Navigator.pop(context, _EditItemResult(
+                name: _nameCtrl.text.trim(),
+                unitPriceCents: cents,
+                expiresOn: expires,
+                expiryWarningDays: warnDays,
+              ));
             }
           },
-          child: const Text('OK'),
+          child: const Text('Save'),
         ),
       ],
     );
@@ -1254,6 +1842,56 @@ class _MoveItemDialogState extends State<_MoveItemDialog> {
   }
 }
 
+/// ===== SIMPLE QTY DIALOG =====
+class _QtyDialog extends StatefulWidget {
+  final String title;
+  final int initial;
+  const _QtyDialog({required this.title, this.initial = 1});
+  @override
+  State<_QtyDialog> createState() => _QtyDialogState();
+}
+class _QtyDialogState extends State<_QtyDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _qtyCtrl;
+  @override
+  void initState() { super.initState(); _qtyCtrl = TextEditingController(text: widget.initial.toString()); }
+  @override
+  void dispose() { _qtyCtrl.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: Form(
+        key: _formKey,
+        child: SizedBox(
+          width: 240,
+          child: TextFormField(
+            controller: _qtyCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Quantity', border: OutlineInputBorder()),
+            validator: (v) {
+              final n = int.tryParse(v ?? '');
+              if (n == null || n <= 0) return 'Enter a positive number';
+              return null;
+            },
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        ElevatedButton(
+          onPressed: () {
+            if (_formKey.currentState!.validate()) {
+              Navigator.pop(context, int.parse(_qtyCtrl.text.trim()));
+            }
+          },
+          child: const Text('OK'),
+        ),
+      ],
+    );
+  }
+}
+
 /// ===== HELPERS =====
 String fmtEuro(int cents) {
   final euros = cents ~/ 100;
@@ -1294,4 +1932,11 @@ int? _parseEuroToCents(String input) {
   final whole = int.parse(parts[0]);
   final frac = int.parse(parts[1].padRight(2, '0'));
   return whole * 100 + frac;
+}
+// For CSV export: 1234 -> "12.34", 1000 -> "10"
+String _euroString(int cents) {
+  final euros = cents ~/ 100;
+  final rem = (cents % 100).abs();
+  if (rem == 0) return euros.toString();
+  return '$euros.${rem.toString().padLeft(2, '0')}';
 }
