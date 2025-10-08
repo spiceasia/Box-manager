@@ -3,15 +3,12 @@ name: Deploy Flutter Web to GitHub Pages
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
 
-# Required for GitHub Pages via Actions
 permissions:
-  contents: read
   pages: write
   id-token: write
+  contents: read
 
-# Only one pages deploy at a time
 concurrency:
   group: "pages"
   cancel-in-progress: true
@@ -20,17 +17,23 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: subosito/flutter-action@v2
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'   # use latest stable Flutter
+          channel: "stable"
 
-      - name: Install packages
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Install dependencies
         run: flutter pub get
 
-      - name: Build web (with base path)
-        run: flutter build web --release --base-href "/box_manage/"
+      - name: Build Web
+        # base-href must match your repo name so assets load on Pages
+        run: flutter build web --release --web-renderer html --base-href /box_manage/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
@@ -38,11 +41,12 @@ jobs:
           path: build/web
 
   deploy:
-    needs: build
-    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
     steps:
-      - id: deployment
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
