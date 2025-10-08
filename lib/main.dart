@@ -494,7 +494,7 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
-    final csvText = const ListToCsvConverter().convert(rows);
+    final csvText = ListToCsvConverter().convert(rows);
     final bytes = utf8.encode(csvText);
     final blob = html.Blob([bytes], 'text/csv');
     final url = html.Url.createObjectUrlFromBlob(blob);
@@ -528,7 +528,7 @@ class _HomePageState extends State<HomePage> {
       await reader.onLoad.first;
       final txt = reader.result as String;
 
-      final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(txt);
+      final rows = CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(txt);
       if (rows.isEmpty) {
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('CSV is empty.')));
