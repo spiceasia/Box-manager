@@ -1306,61 +1306,115 @@ class _BoxDetailsPageState extends State<BoxDetailsPage> {
 }
 
 /// ===== ITEM WHERE PAGE (search results) =====
-class ItemWherePage extends StatelessWidget {
+/// ===== ITEM WHERE PAGE (search results with +/-) =====
+class ItemWherePage extends StatefulWidget {
   final String itemBarcode;
   const ItemWherePage({super.key, required this.itemBarcode});
 
   @override
-  Widget build(BuildContext context) {
-    final item = boxRepo.findItem(itemBarcode);
-    final boxes = boxRepo.allBoxes;
-    final results = <_ItemLocation>[];
-    for (final b in boxes) {
-      final q = boxRepo.getQuantity(b.barcode, itemBarcode);
-      if (q > 0) results.add(_ItemLocation(box: b, qty: q));
-    }
-    results.sort((a, b) => a.box.name.toLowerCase().compareTo(b.box.name.toLowerCase()));
+  State<ItemWherePage> createState() => _ItemWherePageState();
+}
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Where is this item?')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: item == null
-            ? const Center(child: Text('Item not found.'))
-            : Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('Item: ${item.name}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 6),
-                Text('Barcode: ${item.barcode} • Unit: ${fmtEuro(item.unitPriceCents)}'),
-                if (item.expiresOn != null) Text('Expiry: ${fmtYmd(item.expiresOn!)}'),
-                const SizedBox(height: 16),
-                const Divider(),
-                Text(results.isEmpty
-                    ? 'No boxes currently hold this item.'
-                    : 'Found in ${results.length} box(es):',
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 8),
-                Expanded(
-                  child: results.isEmpty
-                      ? const SizedBox.shrink()
-                      : ListView.separated(
-                          itemCount: results.length,
-                          separatorBuilder: (_, __) => const Divider(height: 1),
-                          itemBuilder: (context, i) {
-                            final r = results[i];
-                            return ListTile(
-                              leading: const Icon(Icons.inventory_2_outlined),
-                              title: Text(r.box.name),
-                              subtitle: Text('Van: ${r.box.van} • Box barcode: ${r.box.barcode}'),
-                              trailing: Text('Qty: ${r.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                              onTap: () => Navigator.of(context).push(
-                                MaterialPageRoute(builder: (_) => BoxDetailsPage(boxBarcode: r.box.barcode)),
+class _ItemWherePageState extends State<ItemWherePage> {
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: boxRepo,
+      builder: (context, _) {
+        final item = boxRepo.findItem(widget.itemBarcode);
+
+        // Build results fresh each rebuild so qty is current
+        final results = <_ItemLocation>[];
+        for (final b in boxRepo.allBoxes) {
+          final q = boxRepo.getQuantity(b.barcode, widget.itemBarcode);
+          if (q > 0) results.add(_ItemLocation(box: b, qty: q));
+        }
+        results.sort((a, b) => a.box.name.toLowerCase().compareTo(b.box.name.toLowerCase()));
+
+        return Scaffold(
+          appBar: AppBar(title: const Text('Where is this item?')),
+          body: Padding(
+            padding: const EdgeInsets.all(16),
+            child: item == null
+                ? const Center(child: Text('Item not found.'))
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Item: ${item.name}',
+                          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 6),
+                      Text('Barcode: ${item.barcode} • Unit: ${fmtEuro(item.unitPriceCents)}'),
+                      if (item.expiresOn != null) Text('Expiry: ${fmtYmd(item.expiresOn!)}'),
+                      const SizedBox(height: 16),
+                      const Divider(),
+                      Text(
+                        results.isEmpty
+                            ? 'No boxes currently hold this item.'
+                            : 'Found in ${results.length} box(es):',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      Expanded(
+                        child: results.isEmpty
+                            ? const SizedBox.shrink()
+                            : ListView.separated(
+                                itemCount: results.length,
+                                separatorBuilder: (_, __) => const Divider(height: 1),
+                                itemBuilder: (context, i) {
+                                  final r = results[i];
+                                  final qty = boxRepo.getQuantity(r.box.barcode, widget.itemBarcode);
+
+                                  // Compact trailing controls (work well on mobile)
+                                  final trailing = Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      IconButton(
+                                        tooltip: 'Remove 1',
+                                        onPressed: qty > 0
+                                            ? () async {
+                                                await boxRepo.removeFromBox(
+                                                  boxBarcode: r.box.barcode,
+                                                  itemBarcode: widget.itemBarcode,
+                                                  quantity: 1,
+                                                );
+                                              }
+                                            : null,
+                                        icon: const Icon(Icons.remove),
+                                      ),
+                                      Text('$qty', style: const TextStyle(fontWeight: FontWeight.bold)),
+                                      IconButton(
+                                        tooltip: 'Add 1',
+                                        onPressed: () async {
+                                          await boxRepo.addToBox(
+                                            boxBarcode: r.box.barcode,
+                                            itemBarcode: widget.itemBarcode,
+                                            quantity: 1,
+                                          );
+                                        },
+                                        icon: const Icon(Icons.add),
+                                      ),
+                                    ],
+                                  );
+
+                                  return ListTile(
+                                    leading: const Icon(Icons.inventory_2_outlined),
+                                    title: Text(r.box.name),
+                                    subtitle: Text('Van: ${r.box.van} • Box barcode: ${r.box.barcode}'),
+                                    trailing: trailing,
+                                    onTap: () => Navigator.of(context).push(
+                                      MaterialPageRoute(
+                                        builder: (_) => BoxDetailsPage(boxBarcode: r.box.barcode),
+                                      ),
+                                    ),
+                                  );
+                                },
                               ),
-                            );
-                          },
-                        ),
-                ),
-              ]),
-      ),
+                      ),
+                    ],
+                  ),
+          ),
+        );
+      },
     );
   }
 }
@@ -1370,6 +1424,7 @@ class _ItemLocation {
   final int qty;
   _ItemLocation({required this.box, required this.qty});
 }
+
 
 /// ===== PRINT LABEL PAGE =====
 class PrintLabelPage extends StatelessWidget {
